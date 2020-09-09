@@ -1,0 +1,957 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+
+<script src="https://static.robotwebtools.org/EaselJS/current/easeljs.js"></script>
+<script src="https://static.robotwebtools.org/EventEmitter2/current/eventemitter2.min.js"></script>
+<script src="https://static.robotwebtools.org/roslibjs/current/roslib.js"></script>
+<script type="text/javascript" src="http://static.robotwebtools.org/ros2djs/current/ros2d.min.js"></script>
+<script typr="text/javascript" src="./custom_shape.js"></script>
+<!-- 
+    [1] 滚轮控制地图放大缩小，移动地图
+    [2] 新增目标点 - 左键点击移动画箭头
+        删除目标点 - 左键点击选择移除点
+        选择目标点 - 左键点击选择目标点
+        位姿估计   - 左键点击移动画箭头
+    [3] 显示全局轨迹
+    [4] 显示激光数据
+    [5] 选择地图   - 切换地图且重新初始化位姿 //地图从无到有时不会发生:Bug: Ignoring transform for child_frame_id "odom" from authority "unknown_publisher" because of an invalid quaternion in the transform (-nan -nan -nan -nan)
+    []  保存地图
+    [6] 编辑虚拟墙
+-->
+
+
+<script>
+    var missionType = -1;// -1: 没有任务； 0: 编辑箭头; 1: 编辑虚拟墙
+    // -1: move canvas; 0: add goal; 1: remove goal; 2: go ; 3: pose estimate
+    var arrowState = -1;
+    var wallState = -1;// 0: add virtual wall; 1: remove
+    var threDis = 0.3;// when remove and choose a goal
+    
+    // 连接ROS
+    var ros = new ROSLIB.Ros({
+        url : 'ws://localhost:9090'
+    });
+
+    var map_name_;
+
+    // 虚拟墙集合
+    var walls = [];
+    var wallMarkers = [];
+    // 虚拟墙话题
+    var addVirtulWallTopic = new ROSLIB.Topic({
+        ros: ros,
+        name: '/add_virtual_walls',
+        messageType: 'virtual_wall/virtualWallMsg'
+    });
+    var removeVirtualWallTopic = new ROSLIB.Topic({
+        ros: ros,
+        name: '/remove_virtual_wall',
+        messageType: 'std_msgs/Int8'
+    });
+    // 保存画布上的地图
+    var shiftx = 0.0;
+    var shifty = 0.0;
+    var map_scale = 1.0;
+    var map_width = 1.0;
+    var map_height = 1.0;
+
+    // 位姿估计发布话题
+    var pubPosEstimate = new ROSLIB.Topic({
+        ros: ros,
+        name: '/initialpose',
+        messageType: 'geometry_msgs/PoseWithCovarianceStamped'
+    })
+
+    // 与地图相关的操作，显示marker,画marker,...
+    var viewer;
+    var gridClient;
+    function init() {
+        // 得写在onload里面，不然找不到'map'
+        viewer = new ROS2D.Viewer({
+            divID : 'map',
+            width : 500,
+            height : 400
+        });
+
+        // Setup the map client.
+        gridClient = new OccupancyGridClient({
+            ros : ros,
+            rootObject : viewer.scene,
+            continuous: true,
+            color_: {r: 174, g: 238, b: 238}
+        });
+
+        // 缩放地图适应画布
+        gridClient.on('change', function() {
+            //不变形
+            var scale_ = Math.min(viewer.width/gridClient.currentGrid.width,viewer.height/gridClient.currentGrid.height);
+            viewer.scaleToDimensions(viewer.width/scale_, viewer.height/scale_);
+            viewer.shift(gridClient.currentGrid.pose.position.x, gridClient.currentGrid.pose.position.y);
+            
+            // shiftx += gridClient.currentGrid.pose.position.x;///gridClient.currentGrid.resolution;
+            // shifty += gridClient.currentGrid.pose.position.y;///gridClient.currentGrid.resolution;
+            map_scale = gridClient.currentGrid.resolution;
+            map_width = gridClient.currentGrid.width;
+            map_height = gridClient.currentGrid.height;
+        });
+
+
+        // 滚轮控制画布放大缩小
+        var zoomView = new ROS2D.ZoomView({
+            rootObject: viewer.scene
+        });
+        var scale = 1.0;
+        var scrollFunc = function(e){
+            var e = e || window.event;
+            if(e.target.tagName !== "CANVAS") return;//鼠标在画布上才可以缩放
+            e.preventDefault();
+            var scroll_value;
+            if(e.wheelDelta) 	// IE/Opera/Chrome      
+                scroll_value = e.wheelDelta;  
+            else if(e.detail) 	// Firefox     
+                scroll_value = -e.detail;  
+            // console.log(scroll_value);
+            zoomView.startZoom(e.clientX, e.clientY);
+            if(scroll_value > 0)
+                zoomView.zoom(1.1);
+            else    
+                zoomView.zoom(0.9);
+        }
+        //监听滚轮
+        document.addEventListener('DOMMouseScroll', scrollFunc, false);   // Firefox     
+        document.addEventListener("mousewheel", scrollFunc, { passive: false }); // Chrome
+
+        // 机器人记号
+        var robotMarker = new ROS2D.NavigationArrow({
+            size : 0.25,
+            strokeSize : 0.05,
+            pulse: false,
+            fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
+        });
+
+        // 监听机器人位姿
+        var tfClient = new ROSLIB.TFClient({
+            ros : ros,
+            fixedFrame : '/map',
+            angularThres : 0.01,
+            transThres : 0.01
+        });
+        viewer.scene.addChild(robotMarker);
+        robotMarker.visible = false;
+        robotMarker.scaleX = 1.0 / viewer.scene.scaleX;
+        robotMarker.scaleY = 1.0 / viewer.scene.scaleY;
+        var updateRobotPosition = function(translation,rotation) {
+            robotMarker.x = translation.x;
+            robotMarker.y = -translation.y;
+            robotMarker.rotation = viewer.scene.rosQuaternionToGlobalTheta(rotation);
+            robotMarker.visible = true;
+        };
+        tfClient.subscribe('/base_footprint', function(pose) {
+            updateRobotPosition(pose.translation,pose.rotation);
+            document.getElementById('robotposedisplay').innerHTML = "position: ("+pose.translation.x.toFixed(2)+","+pose.translation.y.toFixed(2)+")";
+        });
+
+
+        // 编辑箭头(新增目标点、删除目标点、选择目标点发布、位姿估计)
+        var goalMarkers = [];//记录目标点
+        var goalPoses = [];
+        
+        var mouseDown = false;
+        var middMouseDown = false;
+        var positionVec3 = null;
+        var goalMarker = new ROS2D.NavigationArrow({
+            size : 0.2,
+            strokeSize : 0.05,
+            fillColor : createjs.Graphics.getRGB(0, 255, 0, 0.66),
+            pulse : false
+        });
+        goalMarker.scaleX = 1.0 / viewer.scene.scaleX;
+        goalMarker.scaleY = 1.0 / viewer.scene.scaleY;
+        goalMarker.visible = false;
+
+        var robotMarkerGhost = new ROS2D.NavigationArrow({
+            size : 0.25,
+            strokeSize : 0.05,
+            pulse: false,
+            fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
+        });
+        robotMarkerGhost.scaleX = 1.0 / viewer.scene.scaleX;
+        robotMarkerGhost.scaleY = 1.0 / viewer.scene.scaleY;
+        robotMarkerGhost.visible = false;
+        
+        var wallbegin = true;
+        var mouseUp = true;
+        var wall = [];//[vertex1,vertex2,...,vertexn]
+        var wall_ = [];//[x1,y1,...,xn,yn]
+        var lastVertex = null;
+        var movingWallMarker = new VirtualWallShape();
+        movingWallMarker.visible = false;
+
+        // 鼠标动作回调函数
+        var mouseEventHandler=function(event, mouseState){
+            var e = e || window.event;
+            switch(missionType){
+                case -1://移动地图
+                // if(e.button == 1 || middMouseDown){
+                    if (mouseState === 'down'){
+                        position = viewer.scene.globalToRos(event.stageX, event.stageY);
+                        positionVec3 = new ROSLIB.Vector3(position);
+                        middMouseDown = true;
+                    }
+                    else if (mouseState === 'move' && middMouseDown){ // e.button = 0 
+                        var currentPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                        var currentPosVec3 = new ROSLIB.Vector3(currentPos);
+                        var xDelta =  currentPosVec3.x - positionVec3.x;
+                        var yDelta =  currentPosVec3.y - positionVec3.y;
+                        viewer.shift(-xDelta, -yDelta);
+                        shifty -= yDelta;
+                        shiftx -= xDelta;
+                    }  
+                    else if(mouseState === 'up' && middMouseDown){
+                        middMouseDown = false;
+                    }
+                // }
+                    break;       
+                case 0://[2]编辑箭头                   
+                    if (mouseState === 'down'){
+                        position = viewer.scene.globalToRos(event.stageX, event.stageY);
+                        positionVec3 = new ROSLIB.Vector3(position);
+                        switch (arrowState) {
+                            case 0://add goal
+                                viewer.scene.addChild(goalMarker);
+                                mouseDown = true;
+                                break;
+                            case 3://pose estimate
+                                viewer.scene.addChild(robotMarkerGhost);
+                                mouseDown = true;
+                                break;
+                            case 1://delete
+                                if(goalPoses.length < 1){
+                                    document.getElementById("warning").innerHTML = "No goal yet";
+                                }
+                                else{
+                                    var ind = 0;
+                                    var minDis = Math.hypot(goalPoses[0].pose.position.x-positionVec3.x, goalPoses[0].pose.position.y-positionVec3.y);
+                                    for(var i=1; i<goalPoses.length; i++){
+                                        var dis = Math.hypot(goalPoses[i].pose.position.x-positionVec3.x, goalPoses[i].pose.position.y-positionVec3.y);
+                                        if(dis<minDis){
+                                            minDis = dis;
+                                            ind = i;
+                                        }
+                                    }
+                                    if(minDis < threDis){
+                                        viewer.scene.removeChild(goalMarkers[ind]);
+                                        goalMarkers[ind] = null;
+                                        for(var i=ind;i<goalPoses.length-1;i++){
+                                            goalMarkers[i] = goalMarkers[i+1];
+                                            goalPoses[i] = goalPoses[i+1];
+                                        }
+                                        goalMarkers.pop();
+                                        goalPoses.pop();
+                                    }
+                                }
+                                break;
+                            case 2://send goal
+                                // select goal
+                                var ind = 0;
+                                var minDis = Math.hypot(goalPoses[0].pose.position.x-positionVec3.x, goalPoses[0].pose.position.y-positionVec3.y);
+                                for(var i=1; i<goalPoses.length; i++){
+                                    var dis = Math.hypot(goalPoses[i].pose.position.x-positionVec3.x, goalPoses[i].pose.position.y-positionVec3.y);
+                                    if(dis<minDis){
+                                        minDis = dis;
+                                        ind = i;
+                                    }
+                                }
+                                if(minDis >= threDis){w
+                                    document.getElementById("warning").innerHTML = "Click again";
+                                    break;
+                                }
+
+                                // send goal
+                                var sendGoalClient = new ROSLIB.ActionClient({
+                                    // object with following keys: * ros - the ROSLIB.Ros connection handle * serverName - the action server name * actionName - the action message name * timeout - the timeout length when connecting to the action server
+                                    ros: ros,
+                                    serverName: 'move_base',
+                                    actionName: 'move_base_msgs/MoveBaseAction'
+                                });
+                                var goal = new ROSLIB.Goal({
+                                    actionClient: sendGoalClient,
+                                    goalMessage: {
+                                        target_pose: {
+                                            header: {
+                                                frame_id: '/map'
+                                            },
+                                            pose: goalPoses[ind].pose // move_base_msg
+                                        }
+                                    }
+                                });
+
+                                goal.on('status', function(status) {
+                                    document.getElementById("NavigationState").innerHTML = 'Navigation status: ' + JSON.stringify(status);
+                                });
+                                goal.send();
+                                break;
+                            default:
+                                break;
+                        }
+                    }
+                    else if (mouseState === 'move' && mouseDown === true){  
+                        var currentPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                        var currentPosVec3 = new ROSLIB.Vector3(currentPos);
+                        
+                        var xDelta =  currentPosVec3.x - positionVec3.x;
+                        var yDelta =  currentPosVec3.y - positionVec3.y;
+
+                        var thetaRadians = Math.atan2(xDelta,yDelta);
+                        var thetaDegrees = thetaRadians * (180.0 / Math.PI);
+                        if (thetaDegrees >= 0 && thetaDegrees <= 180) {
+                            thetaDegrees += 270;
+                        } else {
+                            thetaDegrees -= 90;
+                        }
+
+                        switch(arrowState){
+                            case 0:
+                                goalMarker.x =  positionVec3.x;
+                                goalMarker.y = -positionVec3.y;
+                                goalMarker.rotation = thetaDegrees;
+                                goalMarker.visible = true;
+                                break;
+                            case 3:
+                                robotMarkerGhost.x =  positionVec3.x;
+                                robotMarkerGhost.y = -positionVec3.y;
+                                robotMarkerGhost.rotation = thetaDegrees;
+                                robotMarkerGhost.visible = true;
+                                break;
+                            default:
+                                break;
+                            }		
+                    }
+                    else if(mouseState === 'up' && mouseDown === true){
+                        switch(arrowState){
+                            case 0:
+                                viewer.scene.removeChild(goalMarker);
+                                // save marker
+                                var goalMarker_ = new ROS2D.NavigationArrow({
+                                    size : 0.2,
+                                    strokeSize : 0.05,
+                                    fillColor : createjs.Graphics.getRGB(0, 255, 0, 0.66),
+                                    pulse : false
+                                });
+                                goalMarker_.x =  goalMarker.x;
+                                goalMarker_.y =  goalMarker.y;
+                                goalMarker_.rotation = goalMarker.rotation;
+                                viewer.scene.addChild(goalMarker_);
+                                goalMarkers.push(goalMarker_);
+
+                                var goalPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                                var goalPosVec3 = new ROSLIB.Vector3(goalPos);
+                                var xDelta =  goalPosVec3.x - positionVec3.x;
+                                var yDelta =  goalPosVec3.y - positionVec3.y;
+                                var thetaRadians = Math.atan2(yDelta,xDelta);
+                                var qz =  Math.sin(thetaRadians/2.0);
+                                var qw =  Math.cos(thetaRadians/2.0);
+                                var orientation = new ROSLIB.Quaternion({x:0, y:0, z:qz, w:qw});
+
+                                // save poses
+                                var goalPose = new ROSLIB.Message({
+                                    header:{
+                                        frame_id:'map'
+                                    },
+                                    pose:{
+                                        position:{
+                                            x:positionVec3.x,
+                                            y:positionVec3.y,
+                                            z:0.00
+                                        },
+                                        orientation:{
+                                            x:orientation.x,
+                                            y:orientation.y,
+                                            z:orientation.z,
+                                            w:orientation.w,
+                                        }
+                                    }
+                                });
+                                goalPoses.push(goalPose);
+                                break;
+                            case 3:
+                                var estimatePos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                                var estimatePosVec3 = new ROSLIB.Vector3(estimatePos);
+                                var xDelta =  estimatePosVec3.x - positionVec3.x;
+                                var yDelta =  estimatePosVec3.y - positionVec3.y;
+                                var thetaRadians = Math.atan2(yDelta,xDelta);
+                                var qz =  Math.sin(thetaRadians/2.0);
+                                var qw =  Math.cos(thetaRadians/2.0);
+                                var orientation = new ROSLIB.Quaternion({x:0, y:0, z:qz, w:qw});
+
+                                var estimatePose = new ROSLIB.Message({
+                                    header:{
+                                        frame_id:'map'
+                                    },
+                                    pose:{
+                                        pose:{
+                                            position:{
+                                                x:positionVec3.x,
+                                                y:positionVec3.y,
+                                                z:0.00
+                                            },
+                                            orientation:{
+                                                x:orientation.x,
+                                                y:orientation.y,
+                                                z:orientation.z,
+                                                w:orientation.w,
+                                            }
+                                        }
+                                    }
+                                });
+                                pubPosEstimate.publish(estimatePose);
+                                robotMarkerGhost.visible = false;
+                                break;
+                            default:
+                                break;
+                        }
+                        mouseDown = false;     
+                    }
+                    break;
+                case 1://[6]编辑虚拟墙2D
+                    switch(wallState){
+                        case 0:
+                            if (mouseState === 'down' && mouseUp){
+                                var vertex = viewer.scene.globalToRos(event.stageX, event.stageY);
+                                wall.push(vertex);
+                                wall_.push(vertex.x);
+                                wall_.push(vertex.y);
+                                lastVertex = vertex;
+                                mouseUp = false;
+                            }
+                            else if(mouseState === 'move' && mouseUp === true && wallbegin === false){
+                                var movingVertex = viewer.scene.globalToRos(event.stageX, event.stageY);
+                                var movingWall = [];
+                                movingWall.push(lastVertex);
+                                movingWall.push(movingVertex);
+
+                                if(movingWallMarker.visible) viewer.scene.removeChild(movingWallMarker);
+                                movingWallMarker.setWall(movingWall);
+                                viewer.scene.addChild(movingWallMarker);
+                                movingWallMarker.visible = true;
+                            }
+                            else if(mouseState === 'up' && mouseUp === false){
+                                if(wallbegin){
+                                    // 新建wall
+                                    var wallMarker = new VirtualWallShape();
+                                    wallMarker.setWall(wall);
+                                    viewer.scene.addChild(wallMarker);
+                                    wallMarkers.push(wallMarker);
+                                    wallbegin = false;
+                                }
+                                else{
+                                    wallMarkers[wallMarkers.length - 1].setWall(wall);
+                                    // 中间键结束建墙并发布
+                                    if(e.button == 1){
+                                        wall = [];
+                                        wallbegin = true;
+                                        lastVertex = null;
+                                        movingWallMarker.visible = false;
+                                        var wallMsg = new ROSLIB.Message({
+                                            map_name: map_name_,
+                                            wall: wall_,
+                                            save: false,
+                                            virtualWallEnable: true
+                                        });
+                                        addVirtulWallTopic.publish(wallMsg);
+                                        walls.push(wall_);
+                                        wall_ = [];
+                                    }
+                                }
+                                mouseUp = true;
+                            }
+                            break;
+                        case 1:
+                            if (mouseState !== 'down') break;
+                            var vertex = viewer.scene.globalToRos(event.stageX, event.stageY);
+                            if(wallMarkers.length < 1){
+                                document.getElementById("warning").innerHTML = "There is no virtual wall yet";
+                            }
+                            var minDis = Math.hypot(walls[0][0]-vertex.x,walls[0][1]-vertex.y);
+                            var wallInd = 0;
+                            for(var i=0; i<walls.length;i++){
+                                for(var j=0; j<walls[i].length;j=j+2){
+                                    var dis = Math.hypot(walls[i][j]-vertex.x,walls[i][j+1]-vertex.y);
+                                    if(dis<minDis){
+                                        minDis = dis;
+                                        wallInd = i;
+                                    }
+                                }
+                            }
+                            if(minDis < threDis){
+                                viewer.scene.removeChild(wallMarkers[wallInd]);
+                                walls[wallInd] = null;
+                                for(var i = wallInd; i<wallMarkers.length-1;i++){
+                                    wallMarkers[i] = wallMarkers[i+1];
+                                    walls[i] = walls[i+1];
+                                }
+                                wallMarkers.pop();
+                                walls.pop();
+                                var rmWallMsg = new ROSLIB.Message({
+                                    data: wallInd
+                                });
+                                removeVirtualWallTopic.publish(rmWallMsg);
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }; 
+
+        // Catch mouse action
+        viewer.scene.addEventListener('stagemousedown', function(event){
+            mouseEventHandler(event,'down');
+        }); 
+        viewer.scene.addEventListener('stagemousemove', function(event){
+            mouseEventHandler(event,'move');
+        }); 
+        viewer.scene.addEventListener('stagemouseup', function(event){
+            mouseEventHandler(event,'up');
+        }); 
+
+        // [3] 显示机器人规划的路径
+        var path_display = true;
+        pathListener = new ROSLIB.Topic({
+            ros: ros,
+            name:'/move_base/GlobalPlanner/plan',///move_base/NavfnROS/plan',
+            messageType:'nav_msgs/Path'
+        });
+        pathVisual = new ROS2D.PathShape({
+            strokeSize: 0.03,
+            strokeColor: createjs.Graphics.getRGB(0, 255, 0, 0.8)
+        });
+        pathListener.subscribe(function(virtualpath) {
+            if(pathVisual !== null)
+                viewer.scene.removeChild(pathVisual);
+
+            if(virtualpath.poses.length > 0)
+                pathVisual.setPath(virtualpath);
+
+            if(path_display && (virtualpath.poses.length>0))
+                viewer.scene.addChild(pathVisual);
+        });
+
+        // [4] 显示激光数据
+        var scan_display = true;
+        scanListener = new ROSLIB.Topic({
+            ros: ros,
+            name:'/scan_path',
+            messageType:'nav_msgs/Path'
+        });
+        // scanPoints = new ROS2D.PathShape({
+        scanPoints = new ScanShape({
+            strokeSize: 0.05, 
+            strokeColor: createjs.Graphics.getRGB(255, 0, 0, 1.0)}
+        );
+        scanListener.subscribe(function(scans) 
+        {
+            if(scanPoints !== null)
+                viewer.scene.removeChild(scanPoints);
+
+            if(scans.poses.length > 0)
+                scanPoints.setScan(scans);	
+
+            if(scan_display && (scans.poses.length>0))
+                viewer.scene.addChild(scanPoints);
+        });
+    }
+
+    // 跟着地图切换(switchMap)读取虚拟墙
+    var wallParam = new ROSLIB.Param({
+        ros: ros,
+        name: '/virtualWalls'
+    })
+    var vitrtualWallEnabled = true;
+
+    // [5] 显示地图信息 and 保存初始位姿
+    var initialPoses = [];
+    var map_names = [];
+    var poseInd_;
+    // 读取已有的地图信息
+    var maps = new ROSLIB.Param({
+        ros: ros,
+        name: 'maps'
+    })
+    maps.get(function(mapSet){
+        var info = "map infos:<br>id  name<br>";
+        for(var i=0; i<mapSet.length;i++){
+            info += i +". "+ mapSet[i].name + "<br>"; 
+            map_names.push(mapSet[i].name);
+            initialPoses.push([mapSet[i].initx, mapSet[i].inity, mapSet[i].initheta]);
+            document.getElementById("map"+i.toString()).innerHTML = mapSet[i].name;
+        }
+        document.getElementById("map_infos").innerHTML = info;
+    });
+    // 切换地图
+    var switchMapClient = new ROSLIB.Service({
+        ros : ros,
+        name : '/switch_map', 
+        serviceType : 'map_service/switch_map'});
+    function switchMap(ind){
+        map_name_ = map_names[ind];
+        var request = new ROSLIB.ServiceRequest({name : map_names[ind]});
+        switchMapClient.callService(request, function(result) {
+            if(result.success){
+                console.log('Success');
+            }
+        });
+        poseInd_ = ind;
+        //读取虚拟墙
+        wallParam.get(function(wallSet){
+            walls = [];
+            for(var i=0; i<wallSet.length; i++){
+                if(wallSet[i].name !== map_names[poseInd_]) continue;
+                // 保存虚拟墙
+                for(var j=0;j<wallSet[i]['walls'].length;j++){
+                    var wall = [];
+                    for(var k=0;k<wallSet[i]['walls'][j].length;k++){
+                        wall.push(wallSet[i]['walls'][j][k]);
+                    }
+                    if(wall.length>=4){
+                        walls.push(wall);
+                        wallMarker = new VirtualWallShape();
+                        var wall_ = [];
+                        for(var d = 0; d < wall.length; d=d+2){
+                            var vertex = {x:wall[d],y:wall[d+1]};
+                            wall_.push(vertex);
+                        }
+                        wallMarker.setWall(wall_);
+                        wallMarkers.push(wallMarker);
+                        if(vitrtualWallEnabled){
+                            wallMarker.visible = true;
+                            var startWallMsg = new ROSLIB.Message({
+                                map_name: map_name_,
+                                wall: [],
+                                save: true,
+                                virtualWallEnable: true
+                            });
+                            addVirtulWallTopic.publish(startWallMsg);
+                        }
+                        else{
+                            wallMarker.visible = false;
+                        }
+                        viewer.scene.addChild(wallMarker);
+                    }
+                }
+            }
+        })
+    }
+    // 待地图切换完成后，重新初始化位姿，该位姿是记录在mapInfo中的
+    function initialPoseFun(){
+        var estimatePose = new ROSLIB.Message({
+            header:{
+                frame_id:'map'
+            },
+            pose:{
+                pose:{
+                    position:{
+                        x:initialPoses[poseInd_][0],
+                        y:initialPoses[poseInd_][1],
+                        z:0.0
+                    },
+                    orientation:{
+                        x:0.0,
+                        y:0.0,
+                        z:Math.sin(initialPoses[poseInd_][2]/2.0),
+                        w:Math.cos(initialPoses[poseInd_][2]/2.0)
+                    }
+                }
+            }
+        });
+        pubPosEstimate.publish(estimatePose);
+    }
+
+    // 切换状态
+    function switchArrowState(state_){
+        missionType = 0;
+        arrowState = state_;
+        document.getElementById("warning").innerHTML = "";
+        // document.getElementById("editArrow").style.color = "#000000";
+    }
+    function switchWallState(state_){
+        missionType = 1;
+        wallState = state_;
+        VirtrualWallEnable(true);
+    }
+    function modifyMap(state_){
+        // missionType = 2;
+        // ViewMap = new ROS2D.Viewer({
+        //     divID : 'map2',
+        //     width : viewer.width*map_scale,
+        //     height : viewer.height*map_scale
+        // });
+
+        // // Setup the map client.
+        // gridClient = new OccupancyGridClient2({
+        //     ros : ros,
+        //     rootObject : ViewMap.scene,
+        //     color_: {r: 174, g: 238, b: 238},
+        //     width: map_width/map_scale,
+        //     height: map_height/map_scale,
+        //     resolution: map_scale,
+        //     imageData: gridClient.currentGrid.imageData
+        // });
+        
+        // viewer.shift(-shiftx, -shifty);
+        // console.log(shiftx,shifty);
+        // shiftx = 0; shifty = 0;
+        // // 在当前位置基础上进行放大和缩小
+        // viewer.scaleToDimensions(viewer.width*map_scale, viewer.height*map_scale);
+        // var canvas = document.getElementsByTagName('CANVAS')[0];
+        // var dlLink = document.createElement('a');
+        // dlLink.href = canvas.toDataURL();//会保存变换之前的
+        // dlLink.download = "image00.png";
+        // document.body.appendChild(dlLink);
+        // dlLink.click();
+        // document.body.removeChild(dlLink);
+        
+        // console.log('save');
+        // var canvas = document.createElement("canvas");
+        // canvas.width = map_width/map_scale;
+        // canvas.height = map_height/map_scale;
+        // document.body.appendChild(canvas);
+        // const context = canvas.getContext('2d');
+        // context.putImageData(gridClient.currentGrid.imageData, 0, 0);
+        // var dlLink = document.createElement('a');
+        // dlLink.href = canvas.toDataURL();//会保存变换之前的
+        // dlLink.download = "image00.png";
+        // document.body.appendChild(dlLink);
+        // dlLink.click();
+        // document.body.removeChild(dlLink);
+
+        // viewer2 = new ROS2D.Viewer({
+        //     divID : 'map2',
+        //     width : map_width/map_scale,
+        //     height : map_height/map_scale
+        // });
+        // var robotMarker2 = new ROS2D.NavigationArrow({
+        //     size : 0.25,
+        //     strokeSize : 0.05,
+        //     pulse: false,
+        //     fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
+        // });
+        // // robotMarker.x = 10;
+        // // robotMarker.y = 10;
+        // viewer2.scene.addChild(robotMarker2);
+        // var canvas = document.getElementsByTagName('canvas')[1];
+        //////////////////////////////////////////////////
+        ///////////////////////////////////////////////////
+        var canvas = document.createElement("canvas");
+        // var canvas = document.getElementById('map2');
+        canvas.width = map_width/map_scale;
+        canvas.height = map_height/map_scale;
+        document.body.appendChild(canvas);//注释掉就不会显示地图了
+        const stage = new createjs.Stage(canvas);
+   
+        var grid = new createjs.Shape();
+        // stage.addChild(grid);//Uncaught TypeError: this.graphics.isEmpty is not a function
+        var context = canvas.getContext('2d');
+        
+        var message = gridClient.currentGrid.message;
+        var imageData = context.createImageData(message.info.width, message.info.height);
+        for ( var row = 0; row < message.info.height; row++) {
+            for ( var col = 0; col < message.info.width; col++) {
+            var mapI = col + ((message.info.height - row - 1) * message.info.width);
+            // determine the value
+            var data = message.data[mapI];
+            var val;
+            // determine the index into the image data array
+            if (data === 100) {
+                val = 0;
+            } else if (data === 0) {
+                val = 255;
+            } else {
+                // val = 100-data;
+                val = 150;
+            }
+            var i = (col + (row * message.info.width)) * 4;
+            imageData.data[i] = val;
+            imageData.data[++i] = val;
+            imageData.data[++i] = val;
+            // a
+            imageData.data[++i] = 255;
+            }
+        }
+        context.putImageData(imageData, 0, 0);
+        createjs.Bitmap.call(grid, canvas);
+
+        // var bitmap = new createjs.Bitmap(imageData);
+        // stage.addChild(bitmap);stage.update();
+
+        // var Marker = new DrawPillars();
+        // stage.addChild(Marker);
+        // stage.update();
+
+        var dlLink = document.createElement('a');
+        dlLink.href = canvas.toDataURL();//会保存变换之前的
+        dlLink.download = "image00.png";
+        document.body.appendChild(dlLink);
+        dlLink.click();
+        document.body.removeChild(dlLink);
+    }
+
+    function home(){
+        missionType = -1;
+        arrowState = -1;
+        wallState = -1;
+    }
+    function VirtrualWallEnable(boolValue){
+        vitrtualWallEnabled = boolValue;
+        for(var i = 0; i < wallMarkers.length; i++){
+            wallMarkers[i].visible = boolValue;
+        }
+        var WallMsg = new ROSLIB.Message({
+            map_name: map_name_,
+            wall: [],
+            save: false,
+            virtualWallEnable: boolValue
+            });
+        addVirtulWallTopic.publish(WallMsg);
+    }
+    function saveVirtualWall(){
+        var saveWallMsg = new ROSLIB.Message({
+            map_name: map_name_,
+            wall: [],
+            save: true,
+            virtualWallEnable: true
+        });
+        addVirtulWallTopic.publish(saveWallMsg);
+        home();
+    }
+    
+    // 显示
+    menuEnter = false;
+    function showMenu(_sId, _aId)
+    {
+        menuEnter = true;
+        document.getElementById(_sId).style.display = "";//显示
+        document.getElementById(_aId).style.color = "#000000";
+    }
+    function leaveSelectionBar(_sId, _aId)
+    {
+        menuEnter = false;
+        document.getElementById(_sId).style.display = "none";
+        document.getElementById(_aId).style.color = "#788F72";
+    }
+    function onMenu(_sId)
+    {
+        document.getElementById(_sId).style.display = "";
+    }
+    function leaveMenu(_sId)
+    {
+        if(menuEnter)
+        {
+            document.getElementById(_sId).style.display = "";
+        }
+        else
+        {
+            document.getElementById(_sId).style.display = "none";
+        }
+    }
+    function bgcolor(id)
+    {
+        document.getElementById(id).style.background="";//#F7FFFA
+        document.getElementById(id).style.color="#000";//#000
+    }
+    function nocolor(id)
+    {
+        document.getElementById(id).style.background="";
+        document.getElementById(id).style.color="#788F72";//LightSalmon
+    }
+
+</script>
+</head>
+
+<style type="text/css">
+    .selecttitle{
+        text-align:left;
+        border: 0px;
+        color:#000000;
+        cursor: pointer;
+        /* background:rgba(0,0,0,0.0) url('0.gif') no-repeat; */
+        width: 140px;
+        height: 19px;
+        font-size: 15px}
+</style>
+
+<body onload="init()">
+  <div>
+    <li><button onclick="home()">主页</button></li>
+  </div>
+  <!-- 编辑箭头 -->
+  <div>
+    <li> 
+        <input onmouseover="showMenu('ArrowOption','editArrow')" onmouseleave="leaveSelectionBar('ArrowOption', 'editArrow')" type="text" value="编辑箭头" id="editArrow" class="selecttitle" style="z-index:1" readonly />
+        <div id="ArrowOption" onmouseover="onMenu('ArrowOption')" onmouseleave="leaveMenu('ArrowOption')" style="display:none; z-index:2" class="selected">
+            <span id="e1" onclick="switchArrowState(0)" onMouseOver="bgcolor('e1')" onMouseOut="nocolor('e1')" class="cur" style="color:#788F72">新增目标点</span>
+            <span id="e2" onclick="switchArrowState(1)" onMouseOver="bgcolor('e2')" onMouseOut="nocolor('e2')" class="cur" style="color:#788F72">删除目标点</span>
+            <span id="e3" onclick="switchArrowState(2)" onMouseOver="bgcolor('e3')" onMouseOut="nocolor('e3')" class="cur" style="color:#788F72">选择目标点</span>
+            <span id="e4" onclick="switchArrowState(3)" onMouseOver="bgcolor('e4')" onMouseOut="nocolor('e4')" class="cur" style="color:#788F72">位姿估计</span>
+        </div>
+    </li>
+  </div>
+
+  <p id="robotposedisplay" 	style="color:#788F72; z-index:1"></p>
+
+  <!-- 切换地图 -->
+  <div>
+      <li>
+          <input onmouseover="showMenu('MapOption','switchMap')" onmouseleave="leaveSelectionBar('MapOption', 'switchMap')" type="text" value="选择地图" id="switchMap" class="selecttitle" style="z-index:1" readonly />
+          <div id="MapOption" onmouseover="onMenu('MapOption')" onmouseleave="leaveMenu('MapOption')" style="display:none; z-index:2" class="selected">
+            <span id="map0" onclick="switchMap(0)" onMouseOver="bgcolor('map0')" onMouseOut="nocolor('map0')" class="cur" style="color:#788F72"></span>
+            <span id="map1" onclick="switchMap(1)" onMouseOver="bgcolor('map1')" onMouseOut="nocolor('map1')" class="cur" style="color:#788F72"></span>
+            <span id="map2" onclick="switchMap(2)" onMouseOver="bgcolor('map2')" onMouseOut="nocolor('map2')" class="cur" style="color:#788F72"></span>
+            <span id="map3" onclick="switchMap(3)" onMouseOver="bgcolor('map3')" onMouseOut="nocolor('map3')" class="cur" style="color:#788F72"></span>
+        </div>
+        <button onclick="initialPoseFun()">定位初始位姿</button>
+    </li>
+  </div>
+
+  <!-- 编辑虚拟墙 -->
+  <div>
+    <li> 
+        <input onmouseover="showMenu('WallOption','editWall')" onmouseleave="leaveSelectionBar('WallOption', 'editWall')" type="text" value="编辑虚拟墙" id="editWall" class="selecttitle" style="z-index:1" readonly />
+        <div id="WallOption" onmouseover="onMenu('WallOption')" onmouseleave="leaveMenu('WallOption')" style="display:none; z-index:2" class="selected">
+            <span id="wall1" onclick="switchWallState(0)" onMouseOver="bgcolor('wall1')" onMouseOut="nocolor('wall1')" class="cur" style="color:#788F72">增加虚拟墙</span>
+            <span id="wall2" onclick="switchWallState(1)" onMouseOver="bgcolor('wall2')" onMouseOut="nocolor('wall2')" class="cur" style="color:#788F72">删除虚拟墙</span>
+            <span id="wall4" onclick="VirtrualWallEnable(false);home();" onMouseOver="bgcolor('wall4')" onMouseOut="nocolor('wall4')" class="cur" style="color:#788F72">关闭虚拟墙</span>
+            <span id="wall3" onclick="VirtrualWallEnable(true);home();" onMouseOver="bgcolor('wall3')" onMouseOut="nocolor('wall3')" class="cur" style="color:#788F72">显示虚拟墙</span>
+            <span id="wall0" onclick="saveVirtualWall()" onMouseOver="bgcolor('wall0')" onMouseOut="nocolor('wall0')" class="cur" style="color:#788F72">保存虚拟墙</span>
+        </div>
+    </li>
+  </div>
+
+  <!-- 编辑地图 -->
+  <div>
+    <li>
+        <input onmouseover="showMenu('MapOption2','modifyMap')" onmouseleave="leaveSelectionBar('MapOption2', 'modifyMap')" type="text" value="编辑地图" id="modifyMap" class="selecttitle" style="z-index:1" readonly />
+        <div id="MapOption2" onmouseover="onMenu('MapOption2')" onmouseleave="leaveMenu('MapOption2')" style="display:none; z-index:2" class="selected">
+          <span id="map0_" onclick="modifyMap(0)" onMouseOver="bgcolor('map0_')" onMouseOut="nocolor('map0_')" class="cur" style="color:#788F72">橡皮擦</span>
+          <span id="map1_" onclick="modifyMap(1)" onMouseOver="bgcolor('map1_')" onMouseOut="nocolor('map1_')" class="cur" style="color:#788F72">画笔</span>
+          <span id="map2_" onclick="modifyMap(2)" onMouseOver="bgcolor('map2_')" onMouseOut="nocolor('map2_')" class="cur" style="color:#788F72">拼接</span>
+          <span id="map3_" onclick="modifyMap(3)" onMouseOver="bgcolor('map3_')" onMouseOut="nocolor('map3_')" class="cur" style="color:#788F72">保存</span>
+          <span id="map4_" onclick="modifyMap(4)" onMouseOver="bgcolor('map4_')" onMouseOut="nocolor('map4_')" class="cur" style="color:#788F72">上传地图</span>
+      </div>
+  </li>
+</div>
+
+  <p id="warning" 	style="color:#fc0b3f; z-index:1"></p>
+  <p id="NavigationState" 	style="color:#0b0ffc; z-index:1"></p>
+  
+  <div id="map"></div>
+  <div id="map2"></div>
+  <!-- <canvas id="map2"></canvas> -->
+  <p id="map_infos" style="color:#437910; z-index:1"></p>
+</body>
+</html>

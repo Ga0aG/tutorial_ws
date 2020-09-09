@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+
+<script src="https://static.robotwebtools.org/EaselJS/current/easeljs.js"></script>
+<script src="https://static.robotwebtools.org/EventEmitter2/current/eventemitter2.min.js"></script>
+<script src="https://static.robotwebtools.org/roslibjs/current/roslib.js"></script>
+<script type="text/javascript" src="http://static.robotwebtools.org/ros2djs/current/ros2d.min.js"></script>
+
+<script>
+
+  function init() {
+    // Connect to ROS.
+    var ros = new ROSLIB.Ros({
+      url : 'ws://localhost:9090'
+    });
+
+    // Create the main viewer.
+    var viewer = new ROS2D.Viewer({
+      divID : 'map',
+      width : 700,
+      height : 700
+    });
+
+    // Setup the map client.
+    var gridClient = new ROS2D.OccupancyGridClient({
+      ros : ros,
+      rootObject : viewer.scene
+    });
+    // Scale the canvas to fit to the map
+    gridClient.on('change', function() {
+      viewer.scaleToDimensions(gridClient.currentGrid.width, gridClient.currentGrid.height);
+      viewer.shift(gridClient.currentGrid.pose.position.x, gridClient.currentGrid.pose.position.y);
+    });
+
+    // SHOW ROBOT POSE
+    var robotMarker = new ROS2D.NavigationArrow({
+        size : 0.25,
+        strokeSize : 0.05,
+        pulse: false,
+        fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
+    });
+
+    // Subscribe robot pose
+    // var poseTopic = new ROSLIB.Topic({
+    //     ros: ros,
+    //     name: '/amcl_pose',
+    //     messageType: 'geometry_msgs/PoseWithCovarianceStamped'
+    // });
+    // poseTopic.subscribe(function(pose){
+    //     // viewer.scene.removeChild(robotMarker);
+    //     robotMarker.x = pose.pose.pose.position.x;
+    //     robotMarker.y = -pose.pose.pose.position.y;
+    //     robotMarker.rotation = viewer.scene.rosQuaternionToGlobalTheta(pose.pose.pose.orientation);
+    //     robotMarker.scaleX = 1.0 / viewer.scene.scaleX;
+    //     robotMarker.scaleY = 1.0 / viewer.scene.scaleY;
+    //     document.getElementById('robotposedisplay').innerHTML = "position: ("+pose.pose.pose.position.x.toFixed(2)+","+pose.pose.pose.position.y.toFixed(2)+")";
+    //     viewer.scene.addChild(robotMarker);
+    // });
+
+    // listen to transform from map to robot 
+    var tfClient = new ROSLIB.TFClient({
+        ros : ros,
+        fixedFrame : '/map',
+        angularThres : 0.01,
+        transThres : 0.01
+    });
+    viewer.scene.addChild(robotMarker);
+    robotMarker.visible = false;
+    robotMarker.scaleX = 1.0 / viewer.scene.scaleX;
+    robotMarker.scaleY = 1.0 / viewer.scene.scaleY;
+    var updateRobotPosition = function(translation,rotation) {
+        robotMarker.x = translation.x;
+        robotMarker.y = -translation.y;
+        robotMarker.rotation = viewer.scene.rosQuaternionToGlobalTheta(rotation);
+        robotMarker.visible = true;
+    };
+   
+    // Subscribe to a /base_footprint.
+    tfClient.subscribe('/base_footprint', function(pose) {
+        updateRobotPosition(pose.translation,pose.rotation);
+        document.getElementById('robotposedisplay').innerHTML = "position: ("+pose.translation.x.toFixed(2)+","+pose.translation.y.toFixed(2)+")";
+    });
+
+    // SET A GOAL POSE
+    var mouseDown = false;
+    var positionVec3 = null;
+    var goalMarker = new ROS2D.NavigationArrow({
+        size : 0.2,
+        strokeSize : 0.05,
+        fillColor : createjs.Graphics.getRGB(0, 255, 0, 0.66),
+        pulse : false
+    });
+    goalMarker.scaleX = 1.0 / viewer.scene.scaleX;
+    goalMarker.scaleY = 1.0 / viewer.scene.scaleY;
+    goalMarker.visible = false;
+    viewer.scene.addChild(goalMarker);
+    var mouseEventHandler=function(event, mouseState){
+        if (mouseState === 'down'){
+            // get position when mouse button is pressed down
+            position = viewer.scene.globalToRos(event.stageX, event.stageY);
+            positionVec3 = new ROSLIB.Vector3(position);
+            mouseDown = true;
+        }
+        else if (mouseState === 'move'){
+            if(mouseDown === true){
+                // remove obsolete orientation marker
+                // viewer.scene.removeChild(goalMarker);
+                // visualize goal marker
+                var currentPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                var currentPosVec3 = new ROSLIB.Vector3(currentPos);
+                
+                var xDelta =  currentPosVec3.x - positionVec3.x;
+                var yDelta =  currentPosVec3.y - positionVec3.y;
+                // The y-axis in the image coordinate system is opposite to the map coordinate system
+                var thetaRadians = Math.atan2(xDelta,yDelta);
+                var thetaDegrees = thetaRadians * (180.0 / Math.PI);
+                if (thetaDegrees >= 0 && thetaDegrees <= 180) {
+                    thetaDegrees += 270;
+                } else {
+                    thetaDegrees -= 90;
+                }
+                goalMarker.x =  positionVec3.x;
+                goalMarker.y = -positionVec3.y;
+                goalMarker.rotation = thetaDegrees;
+                goalMarker.visible = true;
+                // viewer.scene.addChild(goalMarker);			
+            }
+        }
+        else if(mouseDown){
+            mouseDown = false;
+            var goalPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+            var goalPosVec3 = new ROSLIB.Vector3(goalPos);
+            var xDelta =  goalPosVec3.x - positionVec3.x;
+            var yDelta =  goalPosVec3.y - positionVec3.y;
+            var thetaRadians = Math.atan2(yDelta,xDelta);
+            var qz =  Math.sin(thetaRadians/2.0);
+		    var qw =  Math.cos(thetaRadians/2.0);
+            var orientation = new ROSLIB.Quaternion({x:0, y:0, z:qz, w:qw});
+
+            // send goal
+            var goalPose = new ROSLIB.Message({
+                header:{
+                    frame_id:'map'
+                },
+                pose:{
+                    position:{
+                        x:positionVec3.x,
+                        y:positionVec3.y,
+                        z:0.00
+                    },
+                    orientation:{
+                        x:orientation.x,
+                        y:orientation.y,
+                        z:orientation.z,
+                        w:orientation.w,
+                    }
+                }
+            });
+            var navGoalPosePub = new ROSLIB.Topic({
+                ros : ros,
+                name:'/move_base_simple/goal',
+                messageType:'geometry_msgs/PoseStamped'});
+            navGoalPosePub.publish(goalPose);
+        }
+    }; 
+
+    // Catch mouse action
+    viewer.scene.addEventListener('stagemousedown', function(event){
+        mouseEventHandler(event,'down');
+    }); 
+    viewer.scene.addEventListener('stagemousemove', function(event){
+        mouseEventHandler(event,'move');
+    }); 
+    viewer.scene.addEventListener('stagemouseup', function(event){
+        mouseEventHandler(event,'up');
+    }); 
+
+    // VISUALIZE PATH
+    var virtual_path_display = true;
+    pathListener = new ROSLIB.Topic({
+        ros: ros,
+        name:'/move_base/NavfnROS/plan',
+        messageType:'nav_msgs/Path'
+    });
+    pathVisual = new ROS2D.PathShape({
+        strokeSize: 0.03,
+        strokeColor: createjs.Graphics.getRGB(0, 255, 0, 0.8)
+    });
+    pathListener.subscribe(function(virtualpath) {
+        if(pathVisual !== null)
+            viewer.scene.removeChild(pathVisual);
+
+        if(virtualpath.poses.length > 0)
+        pathVisual.setPath(virtualpath);
+
+        if(virtual_path_display && (virtualpath.poses.length>0))
+            viewer.scene.addChild(pathVisual);
+    });
+  }
+</script>
+</head>
+
+<body onload="init()">
+  <h1>Sending goal to robot</h1>
+  <div id="map"></div>
+  <p id="robotposedisplay" 	style="color:#788F72; z-index:1"></p>
+</body>
+</html>

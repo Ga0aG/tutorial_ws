@@ -1,0 +1,13 @@
+<launch>
+  <!-- web socket -->
+  <include file="$(find rosbridge_server)/launch/rosbridge_websocket.launch"/>
+
+  <!-- publish tf -->
+  <node pkg="tf2_web_republisher" name="tf2_web_republisher" type="tf2_web_republisher"/>
+
+  <!-- load map information -->
+  <rosparam command="load" file="$(find learning_web)/config/mapInfos.yaml" param="maps"/>
+
+  <!-- start the map service -->
+  <node pkg="map_service" name="map_service" type="map_service"/>
+</launch>

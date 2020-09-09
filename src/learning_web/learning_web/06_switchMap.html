@@ -1,0 +1,641 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+
+<script src="https://static.robotwebtools.org/EaselJS/current/easeljs.js"></script>
+<script src="https://static.robotwebtools.org/EventEmitter2/current/eventemitter2.min.js"></script>
+<script src="https://static.robotwebtools.org/roslibjs/current/roslib.js"></script>
+<script type="text/javascript" src="http://static.robotwebtools.org/ros2djs/current/ros2d.min.js"></script>
+
+<!-- 
+    [1] 滚轮控制地图放大缩小，中键移动地图
+    [2] 新增目标点 - 左键点击移动画箭头
+        删除目标点 - 左键点击选择移除点
+        选择目标点 - 左键点击选择目标点
+        位姿估计   - 左键点击移动画箭头
+    [3] 选择地图   - 切换地图且重新初始化位姿
+    [4] 显示激光数据
+-->
+
+
+<script>
+    // move canvas; pose estimate; 0: add goal; 1: remove goal; 2: go ; 3: pose estimate
+    var arrowState = -1;
+    var threDis = 0.2;// when remove and choose a goal
+    var mapAvailable = [];
+    
+    // Connect to ROS.
+    var ros = new ROSLIB.Ros({
+        url : 'ws://localhost:9090'
+    });
+
+    // 位姿估计
+    var pubPosEstimate = new ROSLIB.Topic({
+        ros: ros,
+        name: '/initialpose',
+        messageType: 'geometry_msgs/PoseWithCovarianceStamped'
+    })
+
+    function init() {
+
+        // Create the main viewer.
+        var viewer = new ROS2D.Viewer({
+            divID : 'map',
+            width : 400,
+            height : 400
+        });
+
+        // Setup the map client.
+        var gridClient = new ROS2D.OccupancyGridClient({
+            ros : ros,
+            rootObject : viewer.scene,
+            continuous: true
+        });
+        // 缩放地图适应画布
+        gridClient.on('change', function() {
+            viewer.scaleToDimensions(gridClient.currentGrid.width, gridClient.currentGrid.height);
+            viewer.shift(gridClient.currentGrid.pose.position.x, gridClient.currentGrid.pose.position.y);
+        });
+
+        // 滚轮控制画布放大缩小
+        var zoomView = new ROS2D.ZoomView({
+            rootObject: viewer.scene
+        });
+        var scale = 1.0;
+        var scrollFunc = function(e){
+            var e = e || window.event;
+            if(e.target.tagName !== "CANVAS") return;//鼠标在画布上才可以缩放
+            e.preventDefault();
+            var scroll_value;
+            if(e.wheelDelta) 	// IE/Opera/Chrome      
+                scroll_value = e.wheelDelta;  
+            else if(e.detail) 	// Firefox     
+                scroll_value = -e.detail;  
+            console.log(scroll_value);
+            zoomView.startZoom(e.clientX, e.clientY);
+            if(scroll_value > 0)
+                zoomView.zoom(1.1);
+            else    
+                zoomView.zoom(0.9);
+        }
+        //监听滚轮
+        document.addEventListener('DOMMouseScroll', scrollFunc, false);   // Firefox     
+        document.addEventListener("mousewheel", scrollFunc, { passive: false }); // Chrome
+
+        // 机器人记号
+        var robotMarker = new ROS2D.NavigationArrow({
+            size : 0.25,
+            strokeSize : 0.05,
+            pulse: false,
+            fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
+        });
+
+        // 监听机器人位姿
+        var tfClient = new ROSLIB.TFClient({
+            ros : ros,
+            fixedFrame : '/map',
+            angularThres : 0.01,
+            transThres : 0.01
+        });
+        viewer.scene.addChild(robotMarker);
+        robotMarker.visible = false;
+        robotMarker.scaleX = 1.0 / viewer.scene.scaleX;
+        robotMarker.scaleY = 1.0 / viewer.scene.scaleY;
+        var updateRobotPosition = function(translation,rotation) {
+            robotMarker.x = translation.x;
+            robotMarker.y = -translation.y;
+            robotMarker.rotation = viewer.scene.rosQuaternionToGlobalTheta(rotation);
+            robotMarker.visible = true;
+        };
+        tfClient.subscribe('/base_footprint', function(pose) {
+            updateRobotPosition(pose.translation,pose.rotation);
+            document.getElementById('robotposedisplay').innerHTML = "position: ("+pose.translation.x.toFixed(2)+","+pose.translation.y.toFixed(2)+")";
+        });
+
+
+        // 编辑箭头(新增目标点、删除目标点、选择目标点发布、位姿估计)
+        var goalMarkers = [];
+        var goalPoses = [];
+        
+        var mouseDown = false;
+        var middMouseDown = false;
+        var positionVec3 = null;
+        var goalMarker = new ROS2D.NavigationArrow({
+            size : 0.2,
+            strokeSize : 0.05,
+            fillColor : createjs.Graphics.getRGB(0, 255, 0, 0.66),
+            pulse : false
+        });
+        goalMarker.scaleX = 1.0 / viewer.scene.scaleX;
+        goalMarker.scaleY = 1.0 / viewer.scene.scaleY;
+        goalMarker.visible = false;
+
+        var robotMarkerGhost = new ROS2D.NavigationArrow({
+            size : 0.25,
+            strokeSize : 0.05,
+            pulse: false,
+            fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
+        });
+        robotMarkerGhost.scaleX = 1.0 / viewer.scene.scaleX;
+        robotMarkerGhost.scaleY = 1.0 / viewer.scene.scaleY;
+        robotMarkerGhost.visible = false;
+
+        // 鼠标动作回调函数
+        var mouseEventHandler=function(event, mouseState){
+            var e = e || window.event;
+            // 鼠标中间键移动地图
+            if(e.button == 1 || middMouseDown){
+                if (mouseState === 'down'){
+                    position = viewer.scene.globalToRos(event.stageX, event.stageY);
+                    positionVec3 = new ROSLIB.Vector3(position);
+                    middMouseDown = true;
+                }
+                else if (mouseState === 'move' && middMouseDown){ // e.button = 0 
+                    var currentPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                    var currentPosVec3 = new ROSLIB.Vector3(currentPos);
+                    var xDelta =  currentPosVec3.x - positionVec3.x;
+                    var yDelta =  currentPosVec3.y - positionVec3.y;
+                    viewer.shift(-xDelta, -yDelta);
+                }  
+                else if(mouseState === 'up' && middMouseDown){
+                    middMouseDown = false;
+                }
+            }
+            // 打点、删除点、分配目标点
+            else{
+            if (mouseState === 'down'){
+                position = viewer.scene.globalToRos(event.stageX, event.stageY);
+                positionVec3 = new ROSLIB.Vector3(position);
+                switch (arrowState) {
+                    case -1:
+                        break;
+                    case 0://add
+                        viewer.scene.addChild(goalMarker);
+                        mouseDown = true;
+                        break;
+                    case 3://pose estimate
+                        viewer.scene.addChild(robotMarkerGhost);
+                        mouseDown = true;
+                        break;
+                    case 1://delete
+                        if(goalPoses.length < 1){
+                            document.getElementById("warning").innerHTML = "No goal yet";
+                        }
+                        else{
+                            var ind = 0;
+                            var minDis = Math.hypot(goalPoses[0].pose.position.x-positionVec3.x, goalPoses[0].pose.position.y-positionVec3.y);
+                            for(var i=1; i<goalPoses.length; i++){
+                                var dis = Math.hypot(goalPoses[i].pose.position.x-positionVec3.x, goalPoses[i].pose.position.y-positionVec3.y);
+                                if(dis<minDis){
+                                    minDis = dis;
+                                    ind = i;
+                                }
+                            }
+                            if(minDis < threDis){
+                                viewer.scene.removeChild(goalMarkers[ind]);
+                                goalMarkers[ind] = null;
+                                for(var i=ind;i<goalPoses.length-1;i++){
+                                    goalMarkers[i] = goalMarkers[i+1];
+                                    goalPoses[i] = goalPoses[i+1];
+                                }
+                                goalMarkers.pop();
+                                goalPoses.pop();
+                            }
+                        }
+                        break;
+                    case 2://send goal
+                        // select goal
+                        var ind = 0;
+                        var minDis = Math.hypot(goalPoses[0].pose.position.x-positionVec3.x, goalPoses[0].pose.position.y-positionVec3.y);
+                        for(var i=1; i<goalPoses.length; i++){
+                            var dis = Math.hypot(goalPoses[i].pose.position.x-positionVec3.x, goalPoses[i].pose.position.y-positionVec3.y);
+                            if(dis<minDis){
+                                minDis = dis;
+                                ind = i;
+                            }
+                        }
+                        if(minDis >= threDis){w
+                            document.getElementById("warning").innerHTML = "Click again";
+                            break;
+                        }
+
+                        // send goal
+                        var sendGoalClient = new ROSLIB.ActionClient({
+                            // object with following keys: * ros - the ROSLIB.Ros connection handle * serverName - the action server name * actionName - the action message name * timeout - the timeout length when connecting to the action server
+                            ros: ros,
+                            serverName: 'move_base',
+                            actionName: 'move_base_msgs/MoveBaseAction'
+                        });
+                        var goal = new ROSLIB.Goal({
+                            actionClient: sendGoalClient,
+                            goalMessage: {
+                                target_pose: {
+                                    header: {
+                                        frame_id: '/map'
+                                    },
+                                    pose: goalPoses[ind].pose // move_base_msg
+                                }
+                            }
+                        });
+
+                        goal.on('status', function(status) {
+                            document.getElementById("NavigationState").innerHTML = 'Navigation status: ' + JSON.stringify(status);
+                        });
+                        goal.send();
+                        break;
+                    default:
+                        break;
+                }
+            }
+            else if (mouseState === 'move' && mouseDown === true){  
+                var currentPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                var currentPosVec3 = new ROSLIB.Vector3(currentPos);
+                
+                var xDelta =  currentPosVec3.x - positionVec3.x;
+                var yDelta =  currentPosVec3.y - positionVec3.y;
+
+                var thetaRadians = Math.atan2(xDelta,yDelta);
+                var thetaDegrees = thetaRadians * (180.0 / Math.PI);
+                if (thetaDegrees >= 0 && thetaDegrees <= 180) {
+                    thetaDegrees += 270;
+                } else {
+                    thetaDegrees -= 90;
+                }
+
+                switch(arrowState){
+                    case 0:
+                        goalMarker.x =  positionVec3.x;
+                        goalMarker.y = -positionVec3.y;
+                        goalMarker.rotation = thetaDegrees;
+                        goalMarker.visible = true;
+                        break;
+                    case 3:
+                        robotMarkerGhost.x =  positionVec3.x;
+                        robotMarkerGhost.y = -positionVec3.y;
+                        robotMarkerGhost.rotation = thetaDegrees;
+                        robotMarkerGhost.visible = true;
+                        break;
+                    default:
+                        break;
+                    }		
+            }
+            else if(mouseState === 'up' && mouseDown === true){
+                switch(arrowState){
+                    case 0:
+                        viewer.scene.removeChild(goalMarker);
+                        // save marker
+                        var goalMarker_ = new ROS2D.NavigationArrow({
+                            size : 0.2,
+                            strokeSize : 0.05,
+                            fillColor : createjs.Graphics.getRGB(0, 255, 0, 0.66),
+                            pulse : false
+                        });
+                        goalMarker_.x =  goalMarker.x;
+                        goalMarker_.y =  goalMarker.y;
+                        goalMarker_.rotation = goalMarker.rotation;
+                        viewer.scene.addChild(goalMarker_);
+                        goalMarkers.push(goalMarker_);
+
+                        var goalPos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                        var goalPosVec3 = new ROSLIB.Vector3(goalPos);
+                        var xDelta =  goalPosVec3.x - positionVec3.x;
+                        var yDelta =  goalPosVec3.y - positionVec3.y;
+                        var thetaRadians = Math.atan2(yDelta,xDelta);
+                        var qz =  Math.sin(thetaRadians/2.0);
+                        var qw =  Math.cos(thetaRadians/2.0);
+                        var orientation = new ROSLIB.Quaternion({x:0, y:0, z:qz, w:qw});
+
+                        // save poses
+                        var goalPose = new ROSLIB.Message({
+                            header:{
+                                frame_id:'map'
+                            },
+                            pose:{
+                                position:{
+                                    x:positionVec3.x,
+                                    y:positionVec3.y,
+                                    z:0.00
+                                },
+                                orientation:{
+                                    x:orientation.x,
+                                    y:orientation.y,
+                                    z:orientation.z,
+                                    w:orientation.w,
+                                }
+                            }
+                        });
+                        goalPoses.push(goalPose);
+                        break;
+                    case 3:
+                        var estimatePos = viewer.scene.globalToRos(event.stageX, event.stageY);
+                        var estimatePosVec3 = new ROSLIB.Vector3(estimatePos);
+                        var xDelta =  estimatePosVec3.x - positionVec3.x;
+                        var yDelta =  estimatePosVec3.y - positionVec3.y;
+                        var thetaRadians = Math.atan2(yDelta,xDelta);
+                        var qz =  Math.sin(thetaRadians/2.0);
+                        var qw =  Math.cos(thetaRadians/2.0);
+                        var orientation = new ROSLIB.Quaternion({x:0, y:0, z:qz, w:qw});
+
+                        var estimatePose = new ROSLIB.Message({
+                            header:{
+                                frame_id:'map'
+                            },
+                            pose:{
+                                pose:{
+                                    position:{
+                                        x:positionVec3.x,
+                                        y:positionVec3.y,
+                                        z:0.00
+                                    },
+                                    orientation:{
+                                        x:orientation.x,
+                                        y:orientation.y,
+                                        z:orientation.z,
+                                        w:orientation.w,
+                                    }
+                                }
+                            }
+                        });
+                        pubPosEstimate.publish(estimatePose);
+                        robotMarkerGhost.visible = false;
+                        break;
+                    default:
+                        break;
+                }
+                mouseDown = false;     
+            }
+            }
+        }; 
+
+        // Catch mouse action
+        viewer.scene.addEventListener('stagemousedown', function(event){
+            mouseEventHandler(event,'down');
+        }); 
+        viewer.scene.addEventListener('stagemousemove', function(event){
+            mouseEventHandler(event,'move');
+        }); 
+        viewer.scene.addEventListener('stagemouseup', function(event){
+            mouseEventHandler(event,'up');
+        }); 
+
+        // 显示机器人规划的路径
+        var path_display = true;
+        pathListener = new ROSLIB.Topic({
+            ros: ros,
+            name:'/move_base/GlobalPlanner/plan',///move_base/NavfnROS/plan',
+            messageType:'nav_msgs/Path'
+        });
+        pathVisual = new ROS2D.PathShape({
+            strokeSize: 0.03,
+            strokeColor: createjs.Graphics.getRGB(0, 255, 0, 0.8)
+        });
+        pathListener.subscribe(function(virtualpath) {
+            if(pathVisual !== null)
+                viewer.scene.removeChild(pathVisual);
+
+            if(virtualpath.poses.length > 0)
+                pathVisual.setPath(virtualpath);
+
+            if(path_display && (virtualpath.poses.length>0))
+                viewer.scene.addChild(pathVisual);
+        });
+
+        // 定义激光形状
+        ScanShape = function(options) {
+            options = options || {};
+            var path = options.path;
+            this.strokeSize = options.strokeSize || 3;
+            this.strokeColor = options.strokeColor || createjs.Graphics.getRGB(0, 0, 0);
+            
+            // draw the line
+            this.graphics = new createjs.Graphics();
+            
+            if (path !== null && typeof path !== 'undefined') {
+                this.graphics.setStrokeStyle(this.strokeSize);
+                this.graphics.beginStroke(this.strokeColor);
+                for (var i=0; i<path.poses.length; ++i) {
+                    this.graphics.drawRect(path.poses[i].pose.position.x / this.scaleX -0.03/this.scaleX,path.poses[i].pose.position.y / -this.scaleY-0.03/this.scaleX, 0.06/this.scaleX, 0.06/this.scaleX);
+                }
+                this.graphics.endStroke();
+            }
+            
+            // create the shape
+            createjs.Shape.call(this, this.graphics);
+        };
+
+        ScanShape.prototype.setPath = function(path) {
+            this.graphics.clear();
+            if (path !== null && typeof path !== 'undefined') {
+                this.graphics.setStrokeStyle(this.strokeSize);
+                this.graphics.beginStroke(this.strokeColor);
+                for (var i=0; i<path.poses.length; ++i) {
+                    this.graphics.drawRect(path.poses[i].pose.position.x / this.scaleX -0.03/this.scaleX,path.poses[i].pose.position.y / -this.scaleY-0.03/this.scaleX, 0.06/this.scaleX, 0.06/this.scaleX);
+                }
+                this.graphics.endStroke();
+            }
+        };
+        ScanShape.prototype.__proto__ = createjs.Shape.prototype;
+
+        // [4] 显示激光数据
+        var scan_display = true;
+        scanListener = new ROSLIB.Topic({
+            ros: ros,
+            name:'/scan_path',
+            messageType:'nav_msgs/Path'
+        });
+        // scanPoints = new ROS2D.PathShape({
+        scanPoints = new ScanShape({
+            strokeSize: 0.05, 
+            strokeColor: createjs.Graphics.getRGB(255, 0, 0, 1.0)}
+        );
+        scanListener.subscribe(function(scans) 
+        {
+            if(scanPoints !== null)
+                viewer.scene.removeChild(scanPoints);
+
+            if(scans.poses.length > 0)
+                scanPoints.setPath(scans);	
+
+            if(scan_display && (scans.poses.length>0))
+                viewer.scene.addChild(scanPoints);
+        });
+    }
+
+    // [3] 显示地图信息 and 保存初始位置
+    var initialPoses = [];
+    var map_names = [];
+    var poseInd_;
+    var maps = new ROSLIB.Param({
+        ros: ros,
+        name: 'maps'
+    })
+    maps.get(function(mapSet){
+        var info = "map infos:<br>id  name<br>";
+        for(var i=0; i<mapSet.length;i++){
+            info += i +". "+ mapSet[i].name + "<br>"; 
+            map_names.push(mapSet[i].name);
+            initialPoses.push([mapSet[i].initx, mapSet[i].inity, mapSet[i].initheta]);
+            document.getElementById("map"+i.toString()).innerHTML = mapSet[i].name;
+        }
+        document.getElementById("map_infos").innerHTML = info;
+    });
+    // 切换地图
+    var switchMapClient = new ROSLIB.Service({
+        ros : ros,
+        name : '/switch_map', 
+        serviceType : 'map_service/switch_map'});
+    function switchMap(ind){
+        // 赶不上
+        // var initialposX = new ROSLIB.Param({
+        //     ros : ros,
+        //     name : '/amcl/initial_pose_x'
+        // })
+        // var initialposY = new ROSLIB.Param({
+        //     ros : ros,
+        //     name : '/amcl/initial_pose_x'
+        // })
+        // var initialposA = new ROSLIB.Param({
+        //     ros : ros,
+        //     name : '/amcl/initial_pose_a'
+        // })
+        // initialposX.set(initialPoses[ind][0]);
+        // initialposY.set(initialPoses[ind][1]);
+        // initialposA.set(initialPoses[ind][2]);
+        
+        // 在地图切换前重新初始化了粒子，但是地图切换后又采用了initial_pose_x的值
+
+        var request = new ROSLIB.ServiceRequest({name : map_names[ind]});
+        switchMapClient.callService(request, function(result) {
+            if(result.success){
+                console.log('Success');
+            }
+        });
+        poseInd_ = ind;
+    }
+    function initialPoseFun(){
+        var estimatePose = new ROSLIB.Message({
+            header:{
+                frame_id:'map'
+            },
+            pose:{
+                pose:{
+                    position:{
+                        x:initialPoses[poseInd_][0],
+                        y:initialPoses[poseInd_][1],
+                        z:0.00
+                    },
+                    orientation:{
+                        x:0.0,
+                        y:0.0,
+                        z:Math.sin(initialPoses[poseInd_][2]/2.0),
+                        w:Math.cos(initialPoses[poseInd_][2]/2.0)
+                    }
+                }
+            }
+        });
+        pubPosEstimate.publish(estimatePose);
+    }
+
+
+    // 切换状态
+    function switchArrowState(state_){
+        arrowState = state_;
+        document.getElementById("warning").innerHTML = "";
+        // document.getElementById("editArrow").style.color = "#000000";
+    }
+   
+
+    // 显示
+    menuEnter = false;
+    function showMenu(_sId, _aId)
+    {
+        menuEnter = true;
+        document.getElementById(_sId).style.display = "";//显示
+        document.getElementById(_aId).style.color = "#000000";
+    }
+    function leaveSelectionBar(_sId, _aId)
+    {
+        menuEnter = false;
+        document.getElementById(_sId).style.display = "none";
+        document.getElementById(_aId).style.color = "#788F72";
+    }
+    function onMenu(_sId)
+    {
+        document.getElementById(_sId).style.display = "";
+    }
+    function leaveMenu(_sId)
+    {
+        if(menuEnter)
+        {
+            document.getElementById(_sId).style.display = "";
+        }
+        else
+        {
+            document.getElementById(_sId).style.display = "none";
+        }
+    }
+    function bgcolor(id)
+    {
+        document.getElementById(id).style.background="";//#F7FFFA
+        document.getElementById(id).style.color="#000";//#000
+    }
+    function nocolor(id)
+    {
+        document.getElementById(id).style.background="";
+        document.getElementById(id).style.color="#788F72";//LightSalmon
+    }
+
+</script>
+</head>
+
+<style type="text/css">
+    .selecttitle{
+        text-align:left;
+        border: 0px;
+        color:#000000;
+        cursor: pointer;
+        /* background:rgba(0,0,0,0.0) url('0.gif') no-repeat; */
+        width: 140px;
+        height: 19px;
+        font-size: 15px}
+</style>
+
+<body onload="init()">
+  <div>
+    <li><button onclick="switchArrowState(-1)">主页</button></li>
+  </div>
+  <div>
+    <li> 
+        <input onmouseover="showMenu('ArrowOption','editArrow')" onmouseleave="leaveSelectionBar('ArrowOption', 'editArrow')" type="text" value="编辑箭头" id="editArrow" class="selecttitle" style="z-index:1" readonly />
+        <div id="ArrowOption" onmouseover="onMenu('ArrowOption')" onmouseleave="leaveMenu('ArrowOption')" style="display:none; z-index:2" class="selected">
+            <span id="e1" onclick="switchArrowState(0)" onMouseOver="bgcolor('e1')" onMouseOut="nocolor('e1')" class="cur" style="color:#788F72">新增目标点</span>
+            <span id="e2" onclick="switchArrowState(1)" onMouseOver="bgcolor('e2')" onMouseOut="nocolor('e2')" class="cur" style="color:#788F72">删除目标点</span>
+            <span id="e3" onclick="switchArrowState(2)" onMouseOver="bgcolor('e3')" onMouseOut="nocolor('e3')" class="cur" style="color:#788F72">选择目标点</span>
+            <span id="e4" onclick="switchArrowState(3)" onMouseOver="bgcolor('e4')" onMouseOut="nocolor('e4')" class="cur" style="color:#788F72">位姿估计</span>
+        </div>
+    </li>
+  </div>
+
+  <p id="robotposedisplay" 	style="color:#788F72; z-index:1"></p>
+
+  <div>
+    <li>
+        <input onmouseover="showMenu('MapOption','switchMap')" onmouseleave="leaveSelectionBar('MapOption', 'switchMap')" type="text" value="选择地图" id="switchMap" class="selecttitle" style="z-index:1" readonly />
+        <div id="MapOption" onmouseover="onMenu('MapOption')" onmouseleave="leaveMenu('MapOption')" style="display:none; z-index:2" class="selected">
+            <span id="map0" onclick="switchMap(0)" onMouseOver="bgcolor('map0')" onMouseOut="nocolor('map0')" class="cur" style="color:#788F72"></span>
+            <span id="map1" onclick="switchMap(1)" onMouseOver="bgcolor('map1')" onMouseOut="nocolor('map1')" class="cur" style="color:#788F72"></span>
+            <span id="map2" onclick="switchMap(2)" onMouseOver="bgcolor('map2')" onMouseOut="nocolor('map2')" class="cur" style="color:#788F72"></span>
+            <span id="map3" onclick="switchMap(3)" onMouseOver="bgcolor('map3')" onMouseOut="nocolor('map3')" class="cur" style="color:#788F72"></span>
+        </div>
+        <button onclick="initialPoseFun()">定位初始位姿</button>
+    </li>
+  </div>
+
+  <p id="warning" 	style="color:#fc0b3f; z-index:1"></p>
+  <p id="NavigationState" 	style="color:#0b0ffc; z-index:1"></p>
+  
+  <div id="map"></div>
+  <p id="map_infos" style="color:#437910; z-index:1"></p>
+</body>
+</html>
