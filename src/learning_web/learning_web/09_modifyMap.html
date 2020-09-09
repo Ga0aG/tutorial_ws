@@ -10,15 +10,22 @@
 <script typr="text/javascript" src="./custom_shape.js"></script>
 <!-- 
     [1] 滚轮控制地图放大缩小，移动地图
-    [2] 新增目标点 - 左键点击移动画箭头
+    [2] 编辑目标点
+        新增目标点 - 左键点击移动画箭头
         删除目标点 - 左键点击选择移除点
         选择目标点 - 左键点击选择目标点
         位姿估计   - 左键点击移动画箭头
     [3] 显示全局轨迹
     [4] 显示激光数据
     [5] 选择地图   - 切换地图且重新初始化位姿 //地图从无到有时不会发生:Bug: Ignoring transform for child_frame_id "odom" from authority "unknown_publisher" because of an invalid quaternion in the transform (-nan -nan -nan -nan)
-    []  保存地图
-    [6] 编辑虚拟墙
+    [6] 编辑虚拟墙 
+        添加虚拟墙 - 左键点击多个墙点，按序连接，中键示意一条墙的最后一个点
+        删除虚拟墙 - 目前是需要点击墙点
+        虚拟墙disable 
+        虚拟墙enable
+        保存虚拟墙
+    [7] 编辑地图(关闭激光数据)
+    [8] 速度控制
 -->
 
 
@@ -684,80 +691,32 @@
         wallState = state_;
         VirtrualWallEnable(true);
     }
+    
     function modifyMap(state_){
-        // missionType = 2;
-        // ViewMap = new ROS2D.Viewer({
-        //     divID : 'map2',
-        //     width : viewer.width*map_scale,
-        //     height : viewer.height*map_scale
-        // });
-
-        // // Setup the map client.
-        // gridClient = new OccupancyGridClient2({
-        //     ros : ros,
-        //     rootObject : ViewMap.scene,
-        //     color_: {r: 174, g: 238, b: 238},
-        //     width: map_width/map_scale,
-        //     height: map_height/map_scale,
-        //     resolution: map_scale,
-        //     imageData: gridClient.currentGrid.imageData
-        // });
-        
-        // viewer.shift(-shiftx, -shifty);
-        // console.log(shiftx,shifty);
-        // shiftx = 0; shifty = 0;
-        // // 在当前位置基础上进行放大和缩小
-        // viewer.scaleToDimensions(viewer.width*map_scale, viewer.height*map_scale);
-        // var canvas = document.getElementsByTagName('CANVAS')[0];
-        // var dlLink = document.createElement('a');
-        // dlLink.href = canvas.toDataURL();//会保存变换之前的
-        // dlLink.download = "image00.png";
-        // document.body.appendChild(dlLink);
-        // dlLink.click();
-        // document.body.removeChild(dlLink);
-        
-        // console.log('save');
-        // var canvas = document.createElement("canvas");
-        // canvas.width = map_width/map_scale;
-        // canvas.height = map_height/map_scale;
-        // document.body.appendChild(canvas);
-        // const context = canvas.getContext('2d');
-        // context.putImageData(gridClient.currentGrid.imageData, 0, 0);
-        // var dlLink = document.createElement('a');
-        // dlLink.href = canvas.toDataURL();//会保存变换之前的
-        // dlLink.download = "image00.png";
-        // document.body.appendChild(dlLink);
-        // dlLink.click();
-        // document.body.removeChild(dlLink);
-
-        // viewer2 = new ROS2D.Viewer({
-        //     divID : 'map2',
-        //     width : map_width/map_scale,
-        //     height : map_height/map_scale
-        // });
-        // var robotMarker2 = new ROS2D.NavigationArrow({
-        //     size : 0.25,
-        //     strokeSize : 0.05,
-        //     pulse: false,
-        //     fillColor: createjs.Graphics.getRGB(0.0, 0.0, 255.0, 0.65)
-        // });
-        // // robotMarker.x = 10;
-        // // robotMarker.y = 10;
-        // viewer2.scene.addChild(robotMarker2);
-        // var canvas = document.getElementsByTagName('canvas')[1];
-        //////////////////////////////////////////////////
-        ///////////////////////////////////////////////////
+        missionType = 2;
+        // check whether it's oversize
+        // Viewer
         var canvas = document.createElement("canvas");
-        // var canvas = document.getElementById('map2');
         canvas.width = map_width/map_scale;
         canvas.height = map_height/map_scale;
+
+        // var originalView = document.getElementById('map').getElementsByTagName('canvas')[0];
+        // document.getElementById('map').removeChild(originalView);
+        // document.getElementById('map').appendChild(canvas);S
         document.body.appendChild(canvas);//注释掉就不会显示地图了
+        
         const stage = new createjs.Stage(canvas);
    
-        var grid = new createjs.Shape();
-        // stage.addChild(grid);//Uncaught TypeError: this.graphics.isEmpty is not a function
-        var context = canvas.getContext('2d');
+        // occupancyGridClient
+        var grid = new createjs.Bitmap();
+        stage.addChild(grid);//Uncaught TypeError: this.graphics.isEmpty is not a function
+        stage.addChild(new ROS2D.Grid({size:1}));
         
+        // OccupancyGrid
+        var canvas2 = document.createElement('canvas');
+        canvas2.width = map_width/map_scale;
+        canvas2.height = map_height/map_scale;
+        var context = canvas2.getContext('2d');
         var message = gridClient.currentGrid.message;
         var imageData = context.createImageData(message.info.width, message.info.height);
         for ( var row = 0; row < message.info.height; row++) {
@@ -784,17 +743,16 @@
             }
         }
         context.putImageData(imageData, 0, 0);
-        createjs.Bitmap.call(grid, canvas);
+        // createjs.Bitmap.call(grid, canvas2);
 
-        // var bitmap = new createjs.Bitmap(imageData);
-        // stage.addChild(bitmap);stage.update();
+        var bitmap = new createjs.Bitmap(canvas2);
+        stage.addChild(bitmap);stage.update();
 
-        // var Marker = new DrawPillars();
-        // stage.addChild(Marker);
-        // stage.update();
-
+        var Marker = new DrawPillars();
+        stage.addChild(Marker);
+        stage.update();
         var dlLink = document.createElement('a');
-        dlLink.href = canvas.toDataURL();//会保存变换之前的
+        dlLink.href = canvas.toDataURL();
         dlLink.download = "image00.png";
         document.body.appendChild(dlLink);
         dlLink.click();
@@ -937,8 +895,8 @@
     <li>
         <input onmouseover="showMenu('MapOption2','modifyMap')" onmouseleave="leaveSelectionBar('MapOption2', 'modifyMap')" type="text" value="编辑地图" id="modifyMap" class="selecttitle" style="z-index:1" readonly />
         <div id="MapOption2" onmouseover="onMenu('MapOption2')" onmouseleave="leaveMenu('MapOption2')" style="display:none; z-index:2" class="selected">
-          <span id="map0_" onclick="modifyMap(0)" onMouseOver="bgcolor('map0_')" onMouseOut="nocolor('map0_')" class="cur" style="color:#788F72">橡皮擦</span>
           <span id="map1_" onclick="modifyMap(1)" onMouseOver="bgcolor('map1_')" onMouseOut="nocolor('map1_')" class="cur" style="color:#788F72">画笔</span>
+          <span id="map0_" onclick="modifyMap(0)" onMouseOver="bgcolor('map0_')" onMouseOut="nocolor('map0_')" class="cur" style="color:#788F72">橡皮擦</span>
           <span id="map2_" onclick="modifyMap(2)" onMouseOver="bgcolor('map2_')" onMouseOut="nocolor('map2_')" class="cur" style="color:#788F72">拼接</span>
           <span id="map3_" onclick="modifyMap(3)" onMouseOver="bgcolor('map3_')" onMouseOut="nocolor('map3_')" class="cur" style="color:#788F72">保存</span>
           <span id="map4_" onclick="modifyMap(4)" onMouseOver="bgcolor('map4_')" onMouseOut="nocolor('map4_')" class="cur" style="color:#788F72">上传地图</span>
